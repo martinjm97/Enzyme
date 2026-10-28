@@ -43,7 +43,9 @@ extern double* __enzyme_todense(void *, ...) noexcept;
 __attribute__((always_inline))
 static double f(size_t N, double* pos) {
     double e = 0.;
-    for (size_t i = 0; i < N; i += 3) {
+    // A vertex count gives the reverse loop a closed-form trip count.
+    for (size_t vertex = 0; vertex < N / 3; ++vertex) {
+        size_t i = 3 * vertex;
         double vx = pos[i];
         double vy = pos[i + 1];
         double vz = pos[i + 2];
@@ -78,7 +80,6 @@ static double ident_load(int64_t idx, size_t i, size_t N) {
 
 __attribute__((enzyme_sparse_accumulate))
 static void inner_store(int64_t row, int64_t col, size_t N, double val, std::vector<triple> &triplets) {
-    printf("row=%d col=%d val=%f\n", row, col % N, val);
     // assert(abs(val) > 0.00001);
     triplets.emplace_back(row % N, col % N, val);
 }
@@ -111,7 +112,8 @@ std::vector<triple> hess_f(size_t N, double* input) {
     std::vector<triple> triplets;
     // input = __enzyme_todense((void*)mod_load, (void*)never_store, input, N);
     __builtin_assume(N > 0);
-    for (size_t i=0; i<N; i++) {
+    // Include the duplicated closing vertex; inner_store folds periodic indices.
+    for (size_t i=0; i<N+3; i++) {
         __builtin_assume(i < 100000000);
         double* d_input = __enzyme_todense((void*)ident_load, (void*)ident_store, i, N);
         double* d_dinput = __enzyme_todense((void*)sparse_load, (void*)sparse_store, i, N, &triplets);
@@ -136,38 +138,41 @@ std::vector<triple> hess_f2(size_t N, double* input) {
 */
 
 // int argc, char** argv
-int __attribute__((always_inline)) main() {
-    //std::mt19937 generator(0); // Seed the random number generator
-    //std::uniform_real_distribution<double> normal(0, 0.05);
+int main() {
+    for (size_t vertices : {3, 8, 17}) {
+        const size_t N = 3 * vertices;
+        std::vector<double> x(N + 3);
+        for (size_t i = 0; i < vertices; ++i) {
+            double angle = 2 * M_PI * i / vertices;
+            x[3 * i] = cos(angle);
+            x[3 * i + 1] = sin(angle);
+            x[3 * i + 2] = 0.1 * cos(2 * angle);
+        }
+        for (size_t i = 0; i < 3; ++i)
+            x[N + i] = x[i];
 
+        // Fold the padded periodic coordinates into both Hessian indices.
+        std::vector<double> sparse(N * N), dense(N * N);
+        for (const auto &entry : hess_f(N, x.data()))
+            sparse[entry.row * N + entry.col] += entry.val;
 
-    // if (argc != 2) {
-    //     printf("Usage: %s <size>\n", argv[0]);
-    //     return 1;
-    // }
-
-    // size_t N = atoi(argv[1]);
-    size_t N = 30;
-
-    double x[3 * N + 3];
-    for (int i = 0; i < N; ++i) {
-        double angle = 2 * M_PI * i / N;
-        x[3 * i] = cos(angle) ;//+ normal(generator);
-        x[3 * i + 1] = sin(angle) ;//+ normal(generator);
-        x[3 * i + 2] = 0;//normal(generator);
+        // Differentiate the same gradient using actual dense buffers. This
+        // bypasses virtual arrays and the sparse-loop optimization under test.
+        for (size_t seed = 0; seed < N + 3; ++seed) {
+            std::vector<double> direction(N + 3), gradient(N + 3), column(N + 3);
+            direction[seed] = 1;
+            __enzyme_fwddiff((void *)grad_f, enzyme_const, N,
+                             enzyme_dup, x.data(), direction.data(),
+                             enzyme_dupnoneed, gradient.data(), column.data());
+            for (size_t j = 0; j < N + 3; ++j)
+                dense[(seed % N) * N + j % N] += column[j];
+        }
+        for (size_t i = 0; i < N * N; ++i)
+            if (!std::isfinite(sparse[i]) || fabs(sparse[i] - dense[i]) > 1e-11) {
+                fprintf(stderr, "Hessian mismatch at %zu: %.17g != %.17g\n",
+                        i, sparse[i], dense[i]);
+                return 1;
+            }
     }
-    x[3 * N] = x[0];
-    x[3 * N + 1] = x[1];
-    x[3 * N + 2] = x[2];
-  auto res = hess_f(N, &x[0]);
-
-    
-
-  printf("%ld\n", res.size());
-
-  for (auto & tup : res)
-      printf("%ld, %ld = %f\n", tup.row, tup.col, tup.val);
-
-  return 0;
+    return 0;
 }
-
